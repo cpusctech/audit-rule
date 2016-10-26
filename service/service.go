@@ -1,56 +1,68 @@
 package service
 
+import (
+	"audit-rule/buslogic"
+	"github.com/kataras/iris"
+	"encoding/json"
+	"audit-rule/log"
+	ae "audit-rule/error"
+	"gopkg.in/validator.v2"
+)
+
 type Service struct {
-	key    []byte
-	//bl     *bl.BusLogic
-	health bool
-	conSem chan bool
+	bl         *buslogic.BusLogic
 }
 
-type Response struct {
-	ReturnCode    int           `json:"code"`
-	ReturnMessage string        `json:"message"`
-	Data          interface{}   `json:"data"`
-	//DevMessage    string        `json:"dev_message"`
-	//context       []interface{} `json:"-"`
-	Status        bool          `json:"status"`
-	//Msg           string        `json:"msg"`
-}
-
-func (s *Service) NewApiOkResponse(extraData interface{}) *Response {
-	return &Response{
-		ReturnCode:    0,
-		ReturnMessage: "OK",
-		Data:          extraData,
+func NewService() *Service {
+	bl, err := buslogic.NewBusLogic()
+	if err != nil {
+		panic(err)
+	}
+	return &Service{
+		bl:         bl,
 	}
 }
 
-func (s *Service) NewAjaxOkResponse() *Response {
-	return &Response{
-		Status:    true,
-		ReturnMessage: "OK",
+func (s *Service) RegisterAll(api *iris.Framework) {
+	s.Register(api, "POST", "/antiFraud/buyer", s.test)
+}
+
+func (s *Service) Register(api *iris.Framework, method, path string, handler func(c *iris.Context) (*Response, error)) {
+	log.CustomLogger.Debug("registered api: %s %s", method, path)
+	api.HandleFunc(method, path, s.wrapIris(handler))
+}
+
+func (s *Service) wrapIris(callback func(c *iris.Context) (*Response, error)) iris.HandlerFunc {
+	return func(c *iris.Context) {
+		defer func() {
+			err := recover()
+			if err != nil {
+				log.CustomLogger.Info("got panic for request: %s, err=%+v", string(c.RequestURI()), err)
+				c.Write(`{
+					"code": -1,
+					"message": "系统错误",
+					"dev_message": ""
+				}`)
+			}
+		}()
+		r, err := callback(c)
+		if err != nil {
+			log.CustomLogger.Error("got error err = %s", err.Error())
+		}
+		body, _ := json.Marshal(r)
+		c.Write(string(body))
 	}
 }
 
-func (s *Service) NewAjaxErrorResponse(errorMessage string) *Response {
-	return &Response{
-		Status: false,
-		ReturnMessage:    errorMessage,
+func (s *Service) jsonRequest(c *iris.Context, request interface{}, callback func() (*Response, error)) (*Response, error) {
+	err := json.Unmarshal(c.PostBody(), request)
+	if err != nil {
+		return s.NewResponse(ae.ERROR_REQUEST_INVALID, "error parse json from request", err.Error()), nil
 	}
-}
-
-func (s *Service) NewErrorResponse(err error) (*Response, error) {
-	if err == nil {
-		panic("should not call this method with nil err")
+	errs := validator.Validate(request)
+	if errs != nil {
+		log.CustomLogger.ErrorWithoutStack("param missing: %v",errs)
+		return s.NewResponse(ae.ERROR_MISSING_PARAM, "required param missing"), nil
 	}
-	derr, ok := err.(*de.QError)
-	if ok {
-		return &Response{
-			ReturnCode:    derr.Code(),
-			ReturnMessage: derr.DisplayMessage(),
-			DevMessage:    derr.Error(),
-		}, nil
-	} else {
-		return nil, err
-	}
+	return callback()
 }
